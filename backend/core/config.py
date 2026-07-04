@@ -33,6 +33,20 @@ class Settings(BaseSettings):
     # ── PostgreSQL ───────────────────────────────────────
     DATABASE_URL: str
 
+    @field_validator("DATABASE_URL", mode="before")
+    @classmethod
+    def use_async_postgres_driver(cls, v: str) -> str:
+        if not isinstance(v, str):
+            return v
+
+        # Render provides a plain postgres/postgresql URL, but the app uses
+        # SQLAlchemy's async engine and installs asyncpg, not psycopg2.
+        if v.startswith("postgres://"):
+            return v.replace("postgres://", "postgresql+asyncpg://", 1)
+        if v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
+
     # ── Redis ────────────────────────────────────────────
     REDIS_HOST: str = "redis"
     REDIS_PORT: int = 6379
@@ -96,3 +110,4 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
