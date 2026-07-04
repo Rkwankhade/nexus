@@ -1,0 +1,160 @@
+# Render Blueprint — deploys the NEXUS backend stack.
+#
+# Usage: push this repo to GitHub, then in the Render dashboard choose
+# "New +" -> "Blueprint" and point it at the repo. Render reads this
+# file and provisions everything below in one pass.
+#
+# Free-tier reality check (verify current limits at render.com/pricing
+# before relying on this for anything beyond a demo):
+#   - 750 combined instance-hours/month across ALL free services in the
+#     workspace. Running all 3 services below 24/7 uses that up in
+#     roughly 10 days, after which they're suspended until next month.
+#     For a portfolio demo, consider pausing celery_worker/celery_beat
+#     when not actively demoing scan/report features, or upgrading the
+#     backend service to Starter ($7/mo) to keep just that one always on.
+#   - Free web services spin down after 15 min idle; the next request
+#     takes ~30-60s to wake it back up. Normal for a free-tier demo.
+#   - Free Postgres: 1GB storage, expires 30 days after creation. Back
+#     up or upgrade before then if you want to keep the data.
+#   - Free Redis (Key Value): 25MB — fine for Celery on a low-traffic
+#     demo, not for production volume.
+#   - Neo4j isn't offered by Render. For the attack-graph feature, sign
+#     up separately for Neo4j Aura's free tier and set NEO4J_URI/
+#     NEO4J_USER/NEO4J_PASSWORD below to those values instead.
+#   - Ollama isn't practical on free hosting (needs persistent disk/RAM
+#     for the model). AI_PROVIDER is set to gemini here instead — still
+#     free, just needs a GEMINI_API_KEY from aistudio.google.com/apikey.
+
+databases:
+  - name: nexus-postgres
+    plan: free
+    databaseName: nexus_db
+    user: nexus
+
+services:
+  - type: redis
+    name: nexus-redis
+    plan: free
+    ipAllowList: []
+
+  - type: web
+    name: nexus-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ALGORITHM
+        value: HS256
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "60"
+      - key: REFRESH_TOKEN_EXPIRE_DAYS
+        value: "7"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nexus-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: nexus-redis
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: nexus-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: nexus-redis
+          property: connectionString
+      - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      # Neo4j Aura free tier — fill these in after creating an Aura
+      # instance, or leave blank if you're not using attack-graph features.
+      - key: NEO4J_URI
+        sync: false
+      - key: NEO4J_USER
+        sync: false
+      - key: NEO4J_PASSWORD
+        sync: false
+      # Set to your actual Netlify URL after the frontend is deployed —
+      # e.g. https://nexus-yourname.netlify.app (no trailing slash).
+      - key: CORS_ORIGINS
+        sync: false
+      - key: SHODAN_API_KEY
+        sync: false
+      - key: UPLOAD_DIR
+        value: /data/uploads
+      - key: REPORT_DIR
+        value: /data/reports
+      - key: LOG_DIR
+        value: /data/logs
+
+  - type: worker
+    name: nexus-celery-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: celery -A workers.celery_app worker --loglevel=info --concurrency=2
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nexus-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: nexus-redis
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: nexus-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: nexus-redis
+          property: connectionString
+      - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false
+
+  - type: worker
+    name: nexus-celery-beat
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: celery -A workers.celery_app beat --loglevel=info
+    plan: free
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: nexus-redis
+          property: connectionString
+      - key: CELERY_BROKER_URL
+        fromService:
+          type: redis
+          name: nexus-redis
+          property: connectionString
+      - key: CELERY_RESULT_BACKEND
+        fromService:
+          type: redis
+          name: nexus-redis
+          property: connectionString
