@@ -1,0 +1,114 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #0a0e1a;
+  --bg-secondary: #0f1629;
+  --bg-card: #141d35;
+  --bg-elevated: #1a2540;
+  --border: #1e3a5f;
+  --accent: #00d4ff;
+  --accent-green: #00ff88;
+  --accent-red: #ff3366;
+  --accent-orange: #ff8c42;
+  --accent-yellow: #ffd700;
+  --text-primary: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #4a5568;
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+code,
+pre,
+.font-mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Subtle background grid for the cyber-ops aesthetic */
+.bg-cyber-grid {
+  background-image:
+    linear-gradient(rgba(30, 58, 95, 0.12) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(30, 58, 95, 0.12) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+/* Scanline overlay - decorative only */
+.scanline-overlay {
+  position: relative;
+  overflow: hidden;
+}
+.scanline-overlay::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    rgba(0, 212, 255, 0.06),
+    transparent
+  );
+  height: 40%;
+  animation: scanline 6s linear infinite;
+  pointer-events: none;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+.card {
+  background-color: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+}
+
+.badge-critical {
+  color: var(--accent-red);
+  background: rgba(255, 51, 102, 0.12);
+  border: 1px solid rgba(255, 51, 102, 0.35);
+}
+.badge-high {
+  color: var(--accent-orange);
+  background: rgba(255, 140, 66, 0.12);
+  border: 1px solid rgba(255, 140, 66, 0.35);
+}
+.badge-medium {
+  color: var(--accent-yellow);
+  background: rgba(255, 215, 0, 0.12);
+  border: 1px solid rgba(255, 215, 0, 0.35);
+}
+.badge-low,
+.badge-info {
+  color: var(--accent);
+  background: rgba(0, 212, 255, 0.12);
+  border: 1px solid rgba(0, 212, 255, 0.35);
+}
+.badge-safe {
+  color: var(--accent-green);
+  background: rgba(0, 255, 136, 0.12);
+  border: 1px solid rgba(0, 255, 136, 0.35);
+}

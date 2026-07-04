@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""
+scripts/seed_data.py — idempotent demo data for local development.
+
+Creates a realistic (but entirely synthetic) engagement: three users
+across the role hierarchy, three targets (two authorized, one left
+PENDING_AUTH to demonstrate the authorization gate), a handful of
+completed scans, a spread of findings across all severities, one
+generated report, some alerts, SIEM log entries, and a single
+PENDING_APPROVAL exploit_attempts row — included only to prove the
+approval ledger works, not to execute anything. Nothing in this
+script runs a tool or reaches out to a target; it writes rows
+directly to the database.
+
+Safe to re-run: every insert is guarded by a "does this already
+exist" lookup, keyed on stable natural keys (username, target value,
+finding title). Re-running just fills in whatever is still missing.
+
+Usage:
+    python scripts/seed_data.py              # seed anything missing
+    python scripts/seed_data.py --reset       # wipe demo data first (asks to confirm)
+    python scripts/seed_data.py --admin-password 'Sup3rSecret!' 
+"""
+from __future__ import annotations
+
+import asyncio
+import sys
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+from sqlalchemy import select, text
+
+# Make `backend/` importable when this script is run directly
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.database import AsyncSessionLocal, engine  # noqa: E402
+from core.security import hash_password  # noqa: E402
+from models.alert import Alert, AlertSeverity, AlertStatus  # noqa: E402
+from models.exploit import ExploitAttempt, ExploitStatus  # noqa: E402
+from models.finding import Finding, FindingStatus, Severity  # noqa: E402
+from models.log_entry import LogEntry, LogSource  # noqa: E402
+from models.report import Report, ReportFormat, ReportStatus  # noqa: E402
+from models.scan import Scan, ScanStatus, ScanType  # noqa: E402
+from models.target import Target, TargetStatus, TargetType  # noqa: E402
+from models.tool_job import ToolJob  # noqa: E402
+from models.user import User, UserRole  # noqa: E402
+
+console = Console()
+app = typer.Typer(add_completion=False)
+
+NOW = lambda: datetime.now(timezone.utc)  # noqa: E731
+
+
+def ago(**kwargs) -> datetime:
+    return NOW() - timedelta(**kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# Demo dataset definition
+# --------------------------------------------------------------------------- #
+
+DEMO_USERS = [
+    {"username": "admin", "email": "admin@nexus.local", "full_name": "Platform Admin", "role": UserRole.ADMIN},
+    {"username": "asha.iyer", "email": "asha.iyer@nexus.local", "full_name": "Asha Iyer", "role": UserRole.ANALYST},
+    {"username": "viewer.guest", "email": "guest@nexus.local", "full_name": "Guest Viewer", "role": UserRole.VIEWER},
+]
+
+DEMO_TARGETS = [
+    {
+        "name": "Corp DMZ",
+        "value": "198.51.100.0/28",
+        "type": TargetType.IP_RANGE,
+        "description": "External-facing DMZ segment — web, mail, VPN gateways.",
+        "authorization_reference": "SOW-2026-014",
+        "status": TargetStatus.AUTHORIZED,
+    },
+    {
+        "name": "Corp Marketing Site",
+        "value": "app.example-corp.test",
+        "type": TargetType.DOMAIN,
+        "description": "Public marketing site + customer portal.",
+        "authorization_reference": "SOW-2026-014",
+        "status": TargetStatus.AUTHORIZED,
+    },
+    {
+        "name": "New Branch Office (awaiting scope sign-off)",
+        "value": "203.0.113.0/24",
+        "type": TargetType.IP_RANGE,
+        "description": "Newly acquired branch network — scope not yet signed.",
+        "authorization_reference": "",
+        "status": TargetStatus.PENDING_AUTH,
+    },
+]
+
+# (target_value, tool, scan_type, status)
+DEMO_SCANS = [
+    ("198.51.100.0/28", "nmap", ScanType.PORT_SCAN, ScanStatus.COMPLETED),
+    ("198.51.100.0/28", "nuclei", ScanType.VULN_SCAN, ScanStatus.COMPLETED),
+    ("app.example-corp.test", "ffuf", ScanType.WEB_SCAN, ScanStatus.COMPLETED),
+    ("app.example-corp.test", "nikto", ScanType.VULN_SCAN, ScanStatus.RUNNING),
+]
+
+# (target_value, finding fields)
+DEMO_FINDINGS = [
+    (
+        "198.51.100.0/28",
+        dict(
+            title="Outdated OpenSSH exposes known CVE",
+            description="OpenSSH 7.4 detected on 198.51.100.5:22, vulnerable to CVE-2018-15473 (username enumeration).",
+            severity=Severity.HIGH,
+            status=FindingStatus.CONFIRMED,
+            cvss_score=5.3,
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+            cve_ids=["CVE-2018-15473"],
+            mitre_techniques=["T1595", "T1590"],
+            affected_host="198.51.100.5",
+            affected_port=22,
+            affected_service="ssh",
+            source_tool="nmap",
+            remediation="Upgrade OpenSSH to a patched release (>= 7.9) and disable version banners.",
+        ),
+    ),
+    (
+        "198.51.100.0/28",
+        dict(
+            title="TLS certificate expired on mail gateway",
+            description="198.51.100.9:443 presents a certificate that expired 14 days ago.",
+            severity=Severity.MEDIUM,
+            status=FindingStatus.OPEN,
+            cvss_score=None,
+            mitre_techniques=["T1595"],
+            affected_host="198.51.100.9",
+            affected_port=443,
+            affected_service="https",
+            source_tool="nuclei",
+            remediation="Renew and redeploy the TLS certificate; enable expiry monitoring.",
+        ),
+    ),
+    (
+        "app.example-corp.test",
+        dict(
+            title="Reflected XSS in search parameter",
+            description="The `q` parameter on /search is reflected without encoding, allowing script injection.",
+            severity=Severity.CRITICAL,
+            status=FindingStatus.OPEN,
+            cvss_score=8.2,
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+            cve_ids=[],
+            mitre_techniques=["T1059.007", "T1189"],
+            affected_host="app.example-corp.test",
+            affected_port=443,
+            affected_service="https",
+            source_tool="dalfox",
+            remediation="Context-aware output encoding on the `q` parameter; add a CSP header.",
+        ),
+    ),
+    (
+        "app.example-corp.test",
+        dict(
+            title="Directory listing enabled on /assets/backup",
+            description="ffuf discovered an unauthenticated, browsable backup directory.",
+            severity=Severity.LOW,
+            status=FindingStatus.OPEN,
+            mitre_techniques=["T1083"],
+            affected_host="app.example-corp.test",
+            affected_service="https",
+            source_tool="ffuf",
+            remediation="Disable directory indexing; remove or relocate the backup directory.",
+        ),
+    ),
+    (
+        "198.51.100.0/28",
+        dict(
+            title="DNS zone transfer allowed",
+            description="AXFR succeeded against 198.51.100.2 without restriction — informational, low direct impact.",
+            severity=Severity.INFO,
+            status=FindingStatus.ACCEPTED_RISK,
+            mitre_techniques=["T1590.002"],
+            affected_host="198.51.100.2",
+            affected_port=53,
+            affected_service="dns",
+            source_tool="dnsx",
+            remediation="Restrict AXFR to designated secondary name servers.",
+        ),
+    ),
+]
+
+DEMO_ALERTS = [
+    dict(
+        title="Multiple failed SSH logins from single source",
+        description="14 failed authentication attempts against 198.51.100.5 in 3 minutes.",
+        severity=AlertSeverity.HIGH,
+        status=AlertStatus.NEW,
+        source="wazuh",
+        rule_id="ssh_bruteforce_threshold",
+        mitre_techniques={"tactic": "Credential Access", "technique": "T1110"},
+    ),
+    dict(
+        title="Suricata alert: possible SQLi payload in HTTP request",
+        description="Suricata matched an ET WEB_SERVER SQL injection signature against app.example-corp.test.",
+        severity=AlertSeverity.CRITICAL,
+        status=AlertStatus.ACKNOWLEDGED,
+        source="suricata",
+        rule_id="ET_WEB_SQLI_GENERIC",
+        mitre_techniques={"tactic": "Initial Access", "technique": "T1190"},
+    ),
+    dict(
+        title="New local admin account created outside change window",
+        description="Endpoint DESKTOP-7QX created a new local administrator account at 02:14 local time.",
+        severity=AlertSeverity.MEDIUM,
+        status=AlertStatus.RESOLVED,
+        source="wazuh",
+        rule_id="win_local_admin_created",
+        mitre_techniques={"tactic": "Persistence", "technique": "T1136.001"},
+    ),
+]
+
+DEMO_LOGS = [
+    dict(
+        source=LogSource.AUTH,
+        host="198.51.100.5",
+        event_type="ssh_login_failed",
+        severity="high",
+        message="Failed password for invalid user oracle from 203.0.113.44 port 51422",
+        matched_rules=["ssh_bruteforce_threshold"],
+    ),
+    dict(
+        source=LogSource.SURICATA,
+        host="app.example-corp.test",
+        event_type="ids_alert",
+        severity="critical",
+        message="ET WEB_SERVER SQL Injection Attempt in HTTP POST body",
+        matched_rules=["ET_WEB_SQLI_GENERIC"],
+    ),
+    dict(
+        source=LogSource.FIREWALL,
+        host="198.51.100.1",
+        event_type="conn_deny",
+        severity="info",
+        message="Denied inbound TCP 45.33.12.9:0 -> 198.51.100.5:3389 (RDP not permitted from WAN)",
+        matched_rules=[],
+    ),
+    dict(
+        source=LogSource.WAZUH,
+        host="DESKTOP-7QX",
+        event_type="account_created",
+        severity="medium",
+        message="New local administrator account 'svc_backup' created outside change window",
+        matched_rules=["win_local_admin_created"],
+    ),
+    dict(
+        source=LogSource.SYSLOG,
+        host="198.51.100.9",
+        event_type="service_restart",
+        severity="info",
+        message="postfix/smtpd restarted after configuration reload",
+        matched_rules=[],
+    ),
+]
+
+
+# --------------------------------------------------------------------------- #
+# Seeding logic
+# --------------------------------------------------------------------------- #
+
+
+async def _get_or_none(session, model, **filters):
+    query = select(model)
+    for k, v in filters.items():
+        query = query.where(getattr(model, k) == v)
+    result = await session.execute(query)
+    return result.scalar_one_or_none()
+
+
+async def seed_users(session, admin_password: str) -> dict[str, User]:
+    created: dict[str, User] = {}
+    for spec in DEMO_USERS:
+        existing = await _get_or_none(session, User, username=spec["username"])
+        if existing:
+            created[spec["username"]] = existing
+            continue
+        password = admin_password if spec["username"] == "admin" else "ChangeMe123!"
+        user = User(
+            email=spec["email"],
+            username=spec["username"],
+            hashed_password=hash_password(password),
+            full_name=spec["full_name"],
+            role=spec["role"],
+            is_active=True,
+        )
+        session.add(user)
+        await session.flush()
+        created[spec["username"]] = user
+        console.print(f"  [green]+[/green] user {spec['username']} ({spec['role'].value})")
+    return created
+
+
+async def seed_targets(session, owner: User) -> dict[str, Target]:
+    created: dict[str, Target] = {}
+    for spec in DEMO_TARGETS:
+        existing = await _get_or_none(session, Target, value=spec["value"])
+        if existing:
+            created[spec["value"]] = existing
+            continue
+        target = Target(
+            name=spec["name"],
+            value=spec["value"],
+            type=spec["type"],
+            description=spec["description"],
+            authorization_reference=spec["authorization_reference"],
+            status=spec["status"],
+            owner_id=owner.id,
+        )
+        session.add(target)
+        await session.flush()
+        created[spec["value"]] = target
+        console.print(f"  [green]+[/green] target {spec['name']} ({spec['status'].value})")
+    return created
+
+
+async def seed_scans(session, targets: dict[str, Target], analyst: User) -> list[Scan]:
+    scans = []
+    for target_value, tool, scan_type, status in DEMO_SCANS:
+        target = targets.get(target_value)
+        if not target:
+            continue
+        existing_result = await session.execute(
+            select(Scan).where(Scan.target_id == target.id, Scan.tool == tool)
+        )
+        existing = existing_result.scalar_one_or_none()
+        if existing:
+            scans.append(existing)
+            continue
+        scan = Scan(
+            target_id=target.id,
+            initiated_by=analyst.id,
+            scan_type=scan_type,
+            tool=tool,
+            status=status,
+            progress_pct=100 if status == ScanStatus.COMPLETED else 42,
+            started_at=ago(hours=2),
+            finished_at=ago(hours=1) if status == ScanStatus.COMPLETED else None,
+        )
+        session.add(scan)
+        await session.flush()
+        scans.append(scan)
+        console.print(f"  [green]+[/green] scan {tool} on {target.name} ({status.value})")
+    return scans
+
+
+async def seed_findings(session, targets: dict[str, Target], scans: list[Scan]) -> list[Finding]:
+    scans_by_target: dict[uuid.UUID, Scan] = {}
+    for s in scans:
+        scans_by_target.setdefault(s.target_id, s)
+
+    findings = []
+    for target_value, spec in DEMO_FINDINGS:
+        target = targets.get(target_value)
+        if not target:
+            continue
+        existing = await _get_or_none(session, Finding, title=spec["title"], target_id=target.id)
+        if existing:
+            findings.append(existing)
+            continue
+        scan = scans_by_target.get(target.id)
+        finding = Finding(target_id=target.id, scan_id=scan.id if scan else None, **spec)
+        session.add(finding)
+        await session.flush()
+        findings.append(finding)
+        console.print(f"  [green]+[/green] finding \"{spec['title']}\" ({spec['severity'].value})")
+    return findings
+
+
+async def seed_report(session, target: Target, findings: list[Finding], user: User) -> Optional[Report]:
+    title = f"{target.name} — Initial Assessment"
+    existing = await _get_or_none(session, Report, title=title, target_id=target.id)
+    if existing:
+        return existing
+    relevant = [f for f in findings if f.target_id == target.id]
+    severities = [f.severity.value for f in relevant]
+    report = Report(
+        target_id=target.id,
+        generated_by=user.id,
+        title=title,
+        format=ReportFormat.PDF,
+        status=ReportStatus.READY,
+        file_path=f"/data/reports/{target.id}-initial.pdf",
+        summary={
+            "finding_count": len(relevant),
+            "critical_count": severities.count("critical"),
+            "high_count": severities.count("high"),
+            "generated_at": NOW().isoformat(),
+        },
+        finding_ids={"ids": [str(f.id) for f in relevant]},
+    )
+    session.add(report)
+    await session.flush()
+    console.print(f"  [green]+[/green] report \"{title}\"")
+    return report
+
+
+async def seed_alerts(session) -> None:
+    for spec in DEMO_ALERTS:
+        existing = await _get_or_none(session, Alert, title=spec["title"])
+        if existing:
+            continue
+        session.add(Alert(**spec))
+        console.print(f"  [green]+[/green] alert \"{spec['title']}\" ({spec['severity'].value})")
+    await session.flush()
+
+
+async def seed_logs(session) -> None:
+    for spec in DEMO_LOGS:
+        existing = await _get_or_none(session, LogEntry, message=spec["message"])
+        if existing:
+            continue
+        session.add(LogEntry(**spec))
+        console.print(f"  [green]+[/green] log entry ({spec['source'].value}/{spec['event_type']})")
+    await session.flush()
+
+
+async def seed_exploit_ledger(session, target: Target, finding: Optional[Finding], analyst: User) -> None:
+    """
+    Adds exactly one PENDING_APPROVAL row so the approval-gated ledger
+    has data to show in the UI. This does not execute anything — status
+    stays PENDING_APPROVAL, and there is no worker in this build that
+    would ever pick it up and act on it.
+    """
+    module = "manual-verification/tls-cert-renewal-check"
+    existing = await _get_or_none(session, ExploitAttempt, module=module, target_id=target.id)
+    if existing:
+        return
+    attempt = ExploitAttempt(
+        finding_id=finding.id if finding else None,
+        target_id=target.id,
+        requested_by=analyst.id,
+        module=module,
+        status=ExploitStatus.PENDING_APPROVAL,
+        justification="Demo row illustrating the human-approval ledger — not an executable request.",
+    )
+    session.add(attempt)
+    await session.flush()
+    console.print("  [green]+[/green] exploit_attempts ledger row (pending_approval, demo only)")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+
+async def _reset() -> None:
+    async with engine.begin() as conn:
+        for table in (
+            "log_entries",
+            "exploit_attempts",
+            "alerts",
+            "reports",
+            "tool_jobs",
+            "findings",
+            "scans",
+            "targets",
+            "users",
+        ):
+            await conn.execute(text(f"TRUNCATE TABLE {table} CASCADE"))
+    console.print("[yellow]Demo tables truncated.[/yellow]")
+
+
+async def _run(admin_password: str) -> None:
+    async with AsyncSessionLocal() as session:
+        console.rule("[bold cyan]Users[/bold cyan]")
+        users = await seed_users(session, admin_password)
+
+        console.rule("[bold cyan]Targets[/bold cyan]")
+        targets = await seed_targets(session, owner=users["admin"])
+
+        console.rule("[bold cyan]Scans[/bold cyan]")
+        scans = await seed_scans(session, targets, analyst=users["asha.iyer"])
+
+        console.rule("[bold cyan]Findings[/bold cyan]")
+        findings = await seed_findings(session, targets, scans)
+
+        console.rule("[bold cyan]Report[/bold cyan]")
+        dmz = targets.get("198.51.100.0/28")
+        if dmz:
+            await seed_report(session, dmz, findings, user=users["admin"])
+
+        console.rule("[bold cyan]Alerts[/bold cyan]")
+        await seed_alerts(session)
+
+        console.rule("[bold cyan]SIEM Log Entries[/bold cyan]")
+        await seed_logs(session)
+
+        console.rule("[bold cyan]Exploit Approval Ledger[/bold cyan]")
+        if dmz:
+            ssh_finding = next((f for f in findings if "OpenSSH" in f.title), None)
+            await seed_exploit_ledger(session, dmz, ssh_finding, analyst=users["asha.iyer"])
+
+        await session.commit()
+
+    _print_summary(users, targets)
+
+
+def _print_summary(users: dict[str, User], targets: dict[str, Target]) -> None:
+    table = Table(title="Seeded Login Credentials", header_style="bold cyan")
+    table.add_column("Username")
+    table.add_column("Role")
+    table.add_column("Password")
+    table.add_row("admin", "admin", "[dim](as provided / default)[/dim]")
+    table.add_row("asha.iyer", "analyst", "ChangeMe123!")
+    table.add_row("viewer.guest", "viewer", "ChangeMe123!")
+    console.print(table)
+    console.print(
+        "[yellow]These are demo credentials — rotate or delete them before any "
+        "non-local deployment.[/yellow]"
+    )
+
+
+@app.command()
+def seed(
+    admin_password: str = typer.Option(
+        "ChangeMe123!", "--admin-password", help="Password to set for the seeded admin user"
+    ),
+    reset: bool = typer.Option(
+        False, "--reset", help="Truncate all demo tables before reseeding (destructive)"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the --reset confirmation prompt"),
+):
+    """Seed (or top up) the local database with demo data."""
+    if reset and not yes:
+        confirm = typer.confirm("This will TRUNCATE all core tables. Continue?", default=False)
+        if not confirm:
+            raise typer.Abort()
+
+    async def _main() -> None:
+        if reset:
+            await _reset()
+        await _run(admin_password)
+
+    asyncio.run(_main())
+    console.print("[bold green]Seed complete.[/bold green]")
+
+
+if __name__ == "__main__":
+    app()
